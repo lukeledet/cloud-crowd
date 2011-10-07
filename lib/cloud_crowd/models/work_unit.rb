@@ -39,27 +39,35 @@ module CloudCrowd
     # action in question disabled.
     def self.distribute_to_nodes
       reservation = nil
-      filter = {}
       loop do
+
+        # Find the available nodes, and determine what actions we're capable
+        # of running at the moment.
+        available_nodes   = NodeRecord.available
+        available_actions = available_nodes.map {|node| node.actions }.flatten.uniq
+        filter            = "action in (#{available_actions.map{|a| "'#{a}'"}.join(',')})"
+
+        # Reserve a handful of available work units.
         WorkUnit.cancel_reservations(reservation) if reservation
         return unless reservation = WorkUnit.reserve_available(:limit => RESERVATION_LIMIT, :conditions => filter)
         work_units = WorkUnit.reserved(reservation)
-        available_nodes = NodeRecord.available
-        while node = available_nodes.shift and unit = work_units.shift do
-          if node.actions.include?(unit.action)
-            if node.send_work_unit(unit)
-              available_nodes.push(node) unless node.busy?
-              next
+
+        # Round robin through the nodes and units, sending the unit if the node
+        # is able to process it.
+        work_units.each do |unit|
+          available_nodes.each do |node|
+            if node.actions.include? unit.action
+              if node.send_work_unit unit
+                work_units.delete unit
+                available_nodes.delete node if node.busy?
+                break
+              end
             end
-          else
-            unit.cancel_reservation
           end
-          work_units.push(unit)
         end
-        if work_units.any? && available_nodes.any?
-          filter = {:action => available_nodes.map {|node| node.actions }.flatten.uniq }
-          next
-        end
+
+        # If we still have units at this point, or we're fresh out of nodes,
+        # that means we're done.
         return if work_units.any? || available_nodes.empty?
       end
     ensure
@@ -70,7 +78,8 @@ module CloudCrowd
     # were none available.
     def self.reserve_available(options={})
       reservation = ActiveSupport::SecureRandom.random_number(MAX_RESERVATION)
-      any = WorkUnit.available.update_all("reservation = #{reservation}", options[:conditions], options) > 0
+      conditions = "reservation is null and node_record_id is null and status in (#{INCOMPLETE.join(',')}) and #{options[:conditions]}"
+      any = WorkUnit.update_all("reservation = #{reservation}", conditions, options) > 0
       any && reservation
     end
 
